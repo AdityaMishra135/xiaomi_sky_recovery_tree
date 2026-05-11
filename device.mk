@@ -1,0 +1,97 @@
+# Copyright 2026 The Android Open Source Project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
+# This file is the build configuration for a full Android
+# build for grouper hardware. This cleanly combines a set of
+# device-specific aspects (drivers) with a device-agnostic
+# product configuration (apps).
+#
+
+$(call inherit-product, $(SRC_TARGET_DIR)/product/base.mk)
+$(call inherit-product, $(SRC_TARGET_DIR)/product/core_64_bit_only.mk)
+$(call inherit-product, $(SRC_TARGET_DIR)/product/emulated_storage.mk)
+
+ifneq ($(wildcard $(SRC_TARGET_DIR)/product/gsi_keys.mk),)
+$(call inherit-product, $(SRC_TARGET_DIR)/product/gsi_keys.mk)
+else ifneq ($(wildcard $(SRC_TARGET_DIR)/product/security/gsi_keys.mk),)
+$(call inherit-product, $(SRC_TARGET_DIR)/product/security/gsi_keys.mk)
+endif
+
+# Platform
+QCOM_BOARD_PLATFORMS += $(PRODUCT_PLATFORM)
+TARGET_BOARD_PLATFORM := $(PRODUCT_PLATFORM)
+TARGET_BOOTLOADER_BOARD_NAME := $(TARGET_BOARD_PLATFORM)
+
+BUILD_BROKEN_DUP_RULES := true
+RELAX_USES_LIBRARY_CHECK := true
+AB_OTA_UPDATER := true
+
+PRODUCT_TARGET_VNDK_VERSION := 31
+PRODUCT_OTA_ENFORCE_VINTF_KERNEL_REQUIREMENTS := false
+
+$(call inherit-product, $(SRC_TARGET_DIR)/product/virtual_ab_ota.mk)
+AB_OTA_PARTITIONS ?= boot vendor_boot recovery vendor vendor_dlkm odm dtbo vbmeta
+PRODUCT_PACKAGES += update_engine \
+    update_engine_client \
+    update_verifier \
+    android.hardware.boot@1.2-impl-qti \
+    android.hardware.boot@1.2-impl-qti.recovery \
+    android.hardware.boot@1.2-service
+
+PRODUCT_PACKAGES += \
+  update_engine_sideload
+
+PRODUCT_PACKAGES += \
+    sg_write_buffer \
+    f2fs_io \
+    check_f2fs
+
+PRODUCT_PACKAGES += \
+    checkpoint_gc
+
+AB_OTA_POSTINSTALL_CONFIG += \
+    RUN_POSTINSTALL_vendor=true \
+    POSTINSTALL_PATH_vendor=bin/checkpoint_gc \
+    FILESYSTEM_TYPE_vendor=ext4 \
+    POSTINSTALL_OPTIONAL_vendor=true
+
+BOARD_SHIPPING_API_LEVEL := 31
+SHIPPING_API_LEVEL := 31
+PRODUCT_SHIPPING_API_LEVEL := 31
+
+TARGET_HAS_GENERIC_KERNEL_HEADERS := true
+TARGET_ENFORCE_AB_OTA_PARTITION_LIST := true
+PRODUCT_USE_DYNAMIC_PARTITIONS := true
+
+PRODUCT_PACKAGES += fastbootd
+PRODUCT_PACKAGES += android.hardware.fastboot@1.1-impl-mock
+
+PRODUCT_PACKAGES += \
+    qcom_decrypt \
+    qcom_decrypt_fbe
+
+PRODUCT_SOONG_NAMESPACES += \
+    $(DEVICE_PATH)
+
+SOONG_CONFIG_NAMESPACES += ufsbsg
+SOONG_CONFIG_ufsbsg += ufsframework
+SOONG_CONFIG_ufsbsg_ufsframework := bsg
+
+BOARD_AVB_VBMETA_SYSTEM := system
+BOARD_AVB_VBMETA_SYSTEM_KEY_PATH := external/avb/test/data/testkey_rsa2048.pem
+BOARD_AVB_VBMETA_SYSTEM_ALGORITHM := SHA256_RSA2048
+BOARD_AVB_VBMETA_SYSTEM_ROLLBACK_INDEX := $(PLATFORM_SECURITY_PATCH_TIMESTAMP)
+BOARD_AVB_VBMETA_SYSTEM_ROLLBACK_INDEX_LOCATION := 2
+PRODUCT_PROPERTY_OVERRIDES += persist.sys.fuse.passthrough.enable=true

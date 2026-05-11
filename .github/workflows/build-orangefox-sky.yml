@@ -1,0 +1,223 @@
+name: OrangeFox - Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_BRANCH:
+        description: OrangeFox Manifest Branch
+        required: true
+        default: "12.1"
+        type: choice
+        options:
+          - "12.1"
+          - "14.1"
+      RECOVERY_VERSION:
+        description: Select Recovery Version
+        required: true
+        default: "R12.0-Beta"
+        type: choice
+        options:
+          - "R11.3"
+          - "R12.0-Beta"
+      DEVICE_TREE:
+        description: OrangeFox Device Tree
+        required: false
+        default: ""
+      DEVICE_TREE_BRANCH:
+        description: OrangeFox Device Tree Branch
+        required: false
+        default: "main"
+      DEVICE_PATH:
+        description: Specify your Device Path
+        required: true
+        default: "device/xiaomi/sky"
+      DEVICE_NAME:
+        description: Specify your Device Codename
+        required: true
+        default: "sky"
+      BUILD_TARGET:
+        description: Specify your Build Target
+        required: true
+        default: "recovery"
+        type: choice
+        options:
+          - boot
+          - recovery
+          - vendorboot
+
+jobs:
+  build:
+    name: Build OFRP by ${{ github.actor }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clean-up
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 24
+
+      - name: Build Environment
+        run: |
+          sudo apt install aria2 -y
+          git clone https://gitlab.com/OrangeFox/misc/scripts.git -b master
+          cd scripts
+          sudo bash setup/android_build_env.sh
+
+      - name: Set-up Manifest
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/OrangeFox"
+          cd "${GITHUB_WORKSPACE}/OrangeFox"
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git clone https://gitlab.com/OrangeFox/sync.git -b master
+          cd sync
+          ./orangefox_sync.sh --branch "${{ inputs.MANIFEST_BRANCH }}" --path "${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}"
+
+      - name: Prepare Device Tree
+        run: |
+          cd "${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}"
+          DEST="./${{ inputs.DEVICE_PATH }}"
+          rm -rf "${DEST}"
+          mkdir -p "${DEST}"
+
+          if [ -n "${{ inputs.DEVICE_TREE }}" ]; then
+            echo "Using external device tree: ${{ inputs.DEVICE_TREE }}"
+            git clone "${{ inputs.DEVICE_TREE }}" -b "${{ inputs.DEVICE_TREE_BRANCH }}" "${DEST}"
+            echo "COMMIT_ID=$(git -C "${DEST}" rev-parse HEAD)" >> "${GITHUB_ENV}"
+          else
+            echo "Using current project as device tree source."
+            rsync -a --delete \
+              --exclude ".git" \
+              --exclude ".github" \
+              --exclude "OrangeFox" \
+              "${GITHUB_WORKSPACE}/" "${DEST}/"
+            echo "COMMIT_ID=$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)" >> "${GITHUB_ENV}"
+          fi
+
+          # Ensure 14.1 build does not fail on kernel extraction during VINTF checks.
+          DEV_MK="${DEST}/device.mk"
+          if [ -f "${DEV_MK}" ]; then
+            if grep -q '^[[:space:]]*PRODUCT_OTA_ENFORCE_VINTF_KERNEL_REQUIREMENTS[[:space:]]*:=' "${DEV_MK}"; then
+              sed -i 's/^[[:space:]]*PRODUCT_OTA_ENFORCE_VINTF_KERNEL_REQUIREMENTS[[:space:]]*:=.*/PRODUCT_OTA_ENFORCE_VINTF_KERNEL_REQUIREMENTS := false/' "${DEV_MK}"
+            else
+              {
+                echo ""
+                echo "# CI override: skip OTA kernel extraction checks for recovery build flow"
+                echo "PRODUCT_OTA_ENFORCE_VINTF_KERNEL_REQUIREMENTS := false"
+              } >> "${DEV_MK}"
+            fi
+            grep -n "PRODUCT_OTA_ENFORCE_VINTF_KERNEL_REQUIREMENTS" "${DEV_MK}" || true
+          fi
+
+      - name: Building OrangeFox
+        run: |
+          cd "${GITHUB_WORKSPACE}/OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}"
+
+          # Fix intermittent missing module issue.
+          if [ ! -d external/guava ]; then
+            echo "external/guava missing; attempting repo sync for guava..."
+            repo sync -c --no-tags --no-clone-bundle --optimized-fetch external/guava -j4 || true
+          fi
+          if [ ! -d external/guava ]; then
+            echo "repo sync did not provide external/guava; cloning fallback mirror..."
+            if [ "${{ inputs.MANIFEST_BRANCH }}" = "12.1" ]; then
+              git clone --depth 1 --branch android-platform-12.1.0_r16 https://android.googlesource.com/platform/external/guava external/guava || \
+              git clone --depth 1 --branch android-platform-12.1.0_r16 https://gitlab.com/aosp-mirror-1/platform/external/guava.git external/guava
+            else
+              git clone --depth 1 https://android.googlesource.com/platform/external/guava external/guava || \
+              git clone --depth 1 https://github.com/aosp-mirror/platform_external_guava external/guava
+            fi
+          fi
+
+          # fox_12.1 cannot parse new guava Android.bp property "is_stubs_module"
+          # (introduced in newer AOSP guava). Pin a compatible guava if needed.
+          if [ "${{ inputs.MANIFEST_BRANCH }}" = "12.1" ] && [ -f external/guava/Android.bp ] && grep -q "is_stubs_module" external/guava/Android.bp; then
+            echo "Detected too-new guava for fox_12.1; replacing with android-platform-12.1.0_r16."
+            rm -rf external/guava
+            git clone --depth 1 --branch android-platform-12.1.0_r16 https://android.googlesource.com/platform/external/guava external/guava || \
+            git clone --depth 1 --branch android-platform-12.1.0_r16 https://gitlab.com/aosp-mirror-1/platform/external/guava.git external/guava
+          fi
+
+          echo "Source sanity check (must be R12-capable for 14.1 branch):"
+          echo "bootable/recovery branch: $(git -C bootable/recovery rev-parse --abbrev-ref HEAD)"
+          echo "vendor/recovery branch:   $(git -C vendor/recovery rev-parse --abbrev-ref HEAD)"
+          grep -n "FOX_INTERNAL_RELEASE" bootable/recovery/orangefox.mk || true
+          grep -Rsn "FOX_INTERNAL_RELEASE=" vendor/recovery/OrangeFox_*.sh || true
+
+          if [ "${{ inputs.MANIFEST_BRANCH }}" = "14.1" ] && [ "${{ inputs.RECOVERY_VERSION }}" = "R12.0-Beta" ]; then
+            if ! grep -q "FOX_INTERNAL_RELEASE := R12" bootable/recovery/orangefox.mk; then
+              echo "ERROR: Expected R12 source in bootable/recovery/orangefox.mk, but not found."
+              exit 1
+            fi
+          fi
+
+          set +e
+          source build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export BUILD_BROKEN_PLUGIN_VALIDATION=true
+          set -e
+          echo "START_TIME=$(date +%s)" >> "${GITHUB_ENV}"
+
+          if [ "${{ inputs.MANIFEST_BRANCH }}" = "14.1" ]; then
+            LUNCH_COMBO="twrp_${{ inputs.DEVICE_NAME }}-ap2a-eng"
+          else
+            LUNCH_COMBO="twrp_${{ inputs.DEVICE_NAME }}-eng"
+          fi
+          echo "Using lunch combo: ${LUNCH_COMBO}"
+          lunch "${LUNCH_COMBO}"
+          mka adbd "${{ inputs.BUILD_TARGET }}image" \
+            PRODUCT_OTA_ENFORCE_VINTF_KERNEL_REQUIREMENTS=false \
+            PRODUCT_ENFORCE_VINTF_MANIFEST=false
+
+          PRODUCT_OUT="out/target/product/${{ inputs.DEVICE_NAME }}"
+          echo "Built artifacts in ${PRODUCT_OUT}:"
+          ls -lah "${PRODUCT_OUT}"/OrangeFox*.img "${PRODUCT_OUT}"/OrangeFox*.zip "${PRODUCT_OUT}"/recovery.img "${PRODUCT_OUT}"/boot.img "${PRODUCT_OUT}"/vendorboot.img "${PRODUCT_OUT}"/vendor_boot.img 2>/dev/null || true
+
+          if [ -f "${PRODUCT_OUT}/recovery.img" ]; then
+            echo "Version markers from recovery.img (best-effort):"
+            strings "${PRODUCT_OUT}/recovery.img" | grep -E "R12\\.0|R11\\.3|ro.orangefox.release.version|OrangeFox Recovery R" | head -n 20 || true
+          fi
+          echo "END_TIME=$(date +%s)" >> "${GITHUB_ENV}"
+
+      - name: Set Release Properties
+        run: |
+          echo "BUILD_DATE=$(date +%Y/%m/%d)" >> "${GITHUB_ENV}"
+          DURATION=$(( END_TIME - START_TIME ))
+          echo "DURATION=$(date -u -d @${DURATION} +'%Mm %Ss')" >> "${GITHUB_ENV}"
+          if [ -n "${{ inputs.DEVICE_TREE }}" ]; then
+            DEVICE_TREE_URL="${{ inputs.DEVICE_TREE }}"
+            [[ "${DEVICE_TREE_URL}" == *.git ]] && DEVICE_TREE_URL="${DEVICE_TREE_URL%.git}"
+          else
+            DEVICE_TREE_URL="${{ github.server_url }}/${{ github.repository }}"
+          fi
+          echo "DEVICE_TREE_URL=${DEVICE_TREE_URL}" >> "${GITHUB_ENV}"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/OrangeFox*.img
+            OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/OrangeFox*.zip
+            OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/boot.img
+            OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/vendorboot.img
+            OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/vendor_boot.img
+            OrangeFox/fox_${{ inputs.MANIFEST_BRANCH }}/out/target/product/${{ inputs.DEVICE_NAME }}/recovery.img
+          name: OrangeFox ${{ inputs.RECOVERY_VERSION }} (fox_${{ inputs.MANIFEST_BRANCH }}) // ${{ env.BUILD_DATE }}
+          tag_name: ${{ github.run_id }}
+          body: |
+            ## OrangeFox Recovery Build - ${{ inputs.RECOVERY_VERSION }}
+            - Device: `${{ inputs.DEVICE_NAME }}`
+            - Branch: `fox_${{ inputs.MANIFEST_BRANCH }}`
+            - Maintainer: @IRONHIDE
+            - Duration: `${{ env.DURATION }}`
+            - Install note: Flash the generated `OrangeFox*.zip` from recovery (recommended for R12 UI/resources), then reboot recovery.
