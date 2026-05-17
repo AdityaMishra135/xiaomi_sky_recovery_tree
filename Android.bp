@@ -20,3 +20,15 @@
 soong_namespace {
 }
 
+soong_config_module_type {
+    name: "ufsbsg_module",
+    module_type: "cc_library",
+    config_namespace: "ufsbsg",
+    string_variables: ["ufsframework"],
+}
+
+soong_config_string_variable {
+    name: "ufsframework",
+    values: ["bsg"],
+}
+
